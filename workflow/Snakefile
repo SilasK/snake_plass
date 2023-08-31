@@ -1,0 +1,150 @@
+from pathlib import Path
+
+
+# absolute path to snakemake dir
+snakemake_dir = Path(workflow.snakefile).parent.resolve()
+
+# include default config values
+configfile: f"{snakemake_dir}/config/default_config.yaml"
+
+
+
+
+def get_all_samples():
+
+    return ["SAMEA6811086","SAMEA6811306" ]
+
+def get_qc_reads(wildcards):
+
+    return "Reads/{sample}.fastq.gz".format(**wildcards)
+
+
+
+
+rule all:
+    input:
+        expand("Intermediate/post_process/createtsv/{sample}.tsv",sample=get_all_samples())
+
+
+rule assemble_proteins:
+    input:
+        get_qc_reads
+
+    output:
+        "Intermediate/post_process/unfiltered_protein_asssemblies/fasta/{sample}.faa"
+    log:
+        "log/plass/{sample}.log"
+    threads:
+        12
+    shell:
+        "plass assemble "
+        " --threads {threads} "
+        " --min-seq-id {config[min_seq_id]} "
+        " --min-length {config[min_length_aa]}"
+        " --translation-table {config[translation_table]}"
+        " {input} {output} "
+        " {resources.tmpdir} &> {log}"
+
+
+
+rule create_db_fasta:
+    input:
+        "Intermediate/post_process/unfiltered_protein_asssemblies/fasta/{sample}.faa"
+    output:
+        temp(directory("Intermediate/post_process/unfiltered_protein_asssemblies/mmseqsdbs/{sample}"))
+    log:
+        "log/post_process/create_db/{sample}.log"
+    shell:
+        "mkdir -p {output} 2> {log} ; "
+        "mmseqs createdb {input} {output}/db &>> {log}"
+
+rule create_proteins_from_reads:
+    input:
+        get_qc_reads
+    output:
+        db=temp(directory("Intermediate/reads_mmseqsdbs/{sample}_nt")),
+        orfs= temp(directory("Intermediate/reads_mmseqsdbs/{sample}_orfs")),
+        proteins= directory("Intermediate/reads_mmseqsdbs/{sample}")
+    threads:
+        4
+    log:
+        "log/create_db/{sample}.log"
+    params:
+        min_length = 30
+    shell:
+        "mkdir {output} 2> {log} "
+        " ;\n"
+        "mmseqs createdb {input} {output.db}/db &>> {log} "
+        " ;\n"
+        "mmseqs extractorfs {output.db}/db {output.orfs}/db "
+        " --use-all-table-starts 1 "
+        " --min-length {params.min_length} "
+        " --threads {threads} "
+        " -v 2 "
+        " &>> {log} "
+        " ;\n"
+        "mmseqs translatenucs {output.orfs}/db {output.proteins}/db "
+        " --translation-table {config[translation_table]} "
+        " --compressed "
+        " --threads {threads} "
+        " -v 2 "
+        " &>> {log} "
+
+
+
+rule map_reads_to_proteins:
+    input:
+        query = "Intermediate/post_process/unfiltered_protein_asssemblies/mmseqsdbs/{sample}",
+        target = "Intermediate/reads_mmseqsdbs/{sample}"
+    output:
+        temp(directory("Intermediate/post_process/mapresults/mmseqsdb/{sample}"))
+    log:
+        "log/post_process/map/{sample}.log"
+    threads:
+        12
+    shell:
+        "mkdir -p {output} 2> {log} ; "
+        " mmseqs map "
+        " --threads {threads} "
+        " -c 0.8  --cov-mode 5" # coverage 0.8 of shorter seq
+        " --min-seq-id {config[min_seq_id]} "
+        " {input.query}/db {input.target}/db {output}/db {resources.tmpdir} &>> {log}"
+
+
+
+rule summarize:
+    input:
+        "Intermediate/post_process/mapresults/mmseqsdb/{sample}"
+    output:
+        temp(directory("Intermediate/post_process/mapresults/summarized_dbs/{sample}"))
+    log:
+        "log/post_process/summarize/{sample}.log"
+    threads:
+        4
+    shell:
+        "mkdir -p {output} 2> {log} ; "
+        "mmseqs summarizealis "
+        " --threads {threads} "
+        " {input}/db {output}/db &>> {log} "
+
+# "Summarize alignment result to one row (uniq. cov., cov., avg. seq. id.)"
+rule create_tsv:
+    input:
+        query = "Intermediate/post_process/unfiltered_protein_asssemblies/mmseqsdbs/{sample}",
+        target = "Intermediate/reads_mmseqsdbs/{sample}",
+        summarized= "Intermediate/post_process/mapresults/summarized_dbs/{sample}"
+    output:
+        "Intermediate/post_process/createtsv/{sample}.tsv"
+    log:
+        "log/post_process/convert_tsv/{sample}.log"
+    threads:
+        4
+    shell:
+        "mmseqs createtsv "
+        " --threads {threads} "
+        " {input.query}/db {input.target}/db  {input.summarized}/db {output} {resources.tmpdir} &> {log} "
+
+
+
+
+# TODO: query and targed missleading
